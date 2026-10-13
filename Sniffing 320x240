@@ -1,0 +1,78 @@
+#include <Arduino.h>
+#include "stn_sniffer.hpp"
+#include "VGA.h"
+#include "Engine3D.h"
+
+// Lookup table to expand each 4-bit nibble (UD0-UD3) into an 8-bit double-pixel mask (640x480 VGA stretch)
+// Active high: '1' bits expand to '11' (white pixels), '0' bits expand to '00' (black pixels)
+static const uint8_t NIBBLE_TO_VGA_EXPAND[16] = {
+    0x00, // 0000 -> 00000000
+    0x03, // 0001 -> 00000011
+    0x0C, // 0010 -> 00001100
+    0x0F, // 0011 -> 00001111
+    0x30, // 0100 -> 00110000
+    0x33, // 0101 -> 00110011
+    0x3C, // 0110 -> 00111100
+    0x3F, // 0111 -> 00111111
+    0xC0, // 1000 -> 11000000
+    0xC3, // 1001 -> 11000011
+    0xCC, // 1010 -> 11001100
+    0xCF, // 1011 -> 11001111
+    0xF0, // 1100 -> 11110000
+    0xF3, // 1101 -> 11110011
+    0xFC, // 1110 -> 11111100
+    0xFF  // 1111 -> 11111111
+};
+
+Engine3D engine3D;
+
+void render_stn_to_vga_optimized(Engine3D& engine) {
+    const uint8_t* stn_buffer = STNSniffer::instance().getFrameBuffer();
+    uint8_t* vga_back = engine.getBackBuffer();
+
+    if (!stn_buffer || !vga_back) return;
+
+    // 320x240 scaled 2x horizontally and vertically to fill 640x480 VGA resolution
+    for (uint16_t stn_y = 0; stn_y < TOTAL_SCAN_LINES; ++stn_y) {
+        const uint32_t* stn_line_src = reinterpret_cast<const uint32_t*>(stn_buffer + (stn_y * CLOCKS_PER_LINE));
+        
+        uint16_t vga_y1 = stn_y * 2;
+        uint16_t vga_y2 = vga_y1 + 1;
+        
+        uint8_t* vga_line1 = vga_back + (vga_y1 * VGA_BYTES_PER_LINE);
+        uint8_t* vga_line2 = vga_back + (vga_y2 * VGA_BYTES_PER_LINE);
+
+        // Process 80 bytes per line in chunks of 4 bytes (20 iterations total for 320 pixels)
+        for (uint16_t i = 0; i < (CLOCKS_PER_LINE / 4); ++i) {
+            uint32_t raw_chunk = stn_line_src[i];
+
+            // Extract and expand 4 bytes concurrently using the lookup table (stretching 320 to 640 pixels wide)
+            uint32_t expanded_chunk = 
+                (static_cast<uint32_t>(NIBBLE_TO_VGA_EXPAND[(raw_chunk >> 0)  & 0x0F]) << 0)  |
+                (static_cast<uint32_t>(NIBBLE_TO_VGA_EXPAND[(raw_chunk >> 8)  & 0x0F]) << 8)  |
+                (static_cast<uint32_t>(NIBBLE_TO_VGA_EXPAND[(raw_chunk >> 16) & 0x0F]) << 16) |
+                (static_cast<uint32_t>(NIBBLE_TO_VGA_EXPAND[(raw_chunk >> 24) & 0x0F]) << 24);
+
+            // Write 32 bits (4 bytes / 16 expanded pixels) to both vertical scale lines
+            reinterpret_cast<uint32_t*>(vga_line1)[i] = expanded_chunk;
+            reinterpret_cast<uint32_t*>(vga_line2)[i] = expanded_chunk;
+        }
+    }
+
+    engine.display();
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    STNSniffer::instance().init();
+    STNSniffer::instance().start();
+
+    engine3D.begin();
+    engine3D.setDoubleBuffering(true);
+}
+
+void loop() {
+    VGA.waitVBlank();
+    render_stn_to_vga_optimized(engine3D);
+}
