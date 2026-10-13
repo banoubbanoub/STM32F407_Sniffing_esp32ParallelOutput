@@ -3,10 +3,11 @@
 #include "VGA.h"
 #include "Engine3D.h"
 
-// Lookup table to expand each 4-bit nibble (UD0-UD3) into an 8-bit double-pixel mask (640x480 VGA stretch)
-// Active high: '1' bits expand to '11' (white pixels), '0' bits expand to '00' (black pixels)
+// Lookup table to expand each 4-bit nibble (UD0-UD3) into an 8-bit double-pixel mask.
+// Each bit is duplicated (e.g., bit 0 becomes bits 0 & 1) to perform a 2x horizontal 
+// stretch from 320 display pixels to 640 VGA columns.
 static const uint8_t NIBBLE_TO_VGA_EXPAND[16] = {
-    0x00, // 0000 -> 00000000
+    0x00, // 0000 -> 00000000 (4 black pixels -> 8 black VGA pixels)
     0x03, // 0001 -> 00000011
     0x0C, // 0010 -> 00001100
     0x0F, // 0011 -> 00001111
@@ -21,58 +22,74 @@ static const uint8_t NIBBLE_TO_VGA_EXPAND[16] = {
     0xF0, // 1100 -> 11110000
     0xF3, // 1101 -> 11110011
     0xFC, // 1110 -> 11111100
-    0xFF  // 1111 -> 11111111
+    0xFF  // 1111 -> 11111111 (4 white pixels -> 8 white VGA pixels)
 };
 
 Engine3D engine3D;
 
 void render_stn_to_vga_optimized(Engine3D& engine) {
+    // 1. Fetch pointers to the active STN captured frame buffer and VGA back buffer
     const uint8_t* stn_buffer = STNSniffer::instance().getFrameBuffer();
     uint8_t* vga_back = engine.getBackBuffer();
 
     if (!stn_buffer || !vga_back) return;
 
-    // 320x240 scaled 2x horizontally and vertically to fill 640x480 VGA resolution
+    // 2. Loop through each scanline of the 320x240 display (240 total lines)
     for (uint16_t stn_y = 0; stn_y < TOTAL_SCAN_LINES; ++stn_y) {
+        // Point to the beginning of the current 80-byte scanline in the STN buffer,
+        // reinterpreting as 32-bit chunks (4 bytes = 16 pixels per chunk)
         const uint32_t* stn_line_src = reinterpret_cast<const uint32_t*>(stn_buffer + (stn_y * CLOCKS_PER_LINE));
         
+        // Calculate vertical 2x scaling coordinates for 480-line VGA resolution
         uint16_t vga_y1 = stn_y * 2;
         uint16_t vga_y2 = vga_y1 + 1;
         
+        // Get row destination pointers in the VGA back buffer
         uint8_t* vga_line1 = vga_back + (vga_y1 * VGA_BYTES_PER_LINE);
         uint8_t* vga_line2 = vga_back + (vga_y2 * VGA_BYTES_PER_LINE);
 
-        // Process 80 bytes per line in chunks of 4 bytes (20 iterations total for 320 pixels)
+        // 3. Process 80 bytes per line in chunks of 4 bytes (20 iterations total)
         for (uint16_t i = 0; i < (CLOCKS_PER_LINE / 4); ++i) {
+            // Load 32 bits (4 raw bytes) from the source line
             uint32_t raw_chunk = stn_line_src[i];
 
-            // Extract and expand 4 bytes concurrently using the lookup table (stretching 320 to 640 pixels wide)
+            // Apply bitwise NOT (~raw_chunk) to invert video polarity so highlights 
+            // (dark selection boxes with light text) render correctly on the monitor
+            raw_chunk = ~raw_chunk;
+
+            // Extract each byte, isolate its 4-bit nibble, and expand it using the lookup table.
+            // Shift each expanded result into its proper 8-bit position within the 32-bit word.
             uint32_t expanded_chunk = 
                 (static_cast<uint32_t>(NIBBLE_TO_VGA_EXPAND[(raw_chunk >> 0)  & 0x0F]) << 0)  |
                 (static_cast<uint32_t>(NIBBLE_TO_VGA_EXPAND[(raw_chunk >> 8)  & 0x0F]) << 8)  |
                 (static_cast<uint32_t>(NIBBLE_TO_VGA_EXPAND[(raw_chunk >> 16) & 0x0F]) << 16) |
                 (static_cast<uint32_t>(NIBBLE_TO_VGA_EXPAND[(raw_chunk >> 24) & 0x0F]) << 24);
 
-            // Write 32 bits (4 bytes / 16 expanded pixels) to both vertical scale lines
+            // Write the 32-bit expanded chunk (representing 16 stretched pixels) to 
+            // both vertical scanline rows concurrently for 2x vertical scaling
             reinterpret_cast<uint32_t*>(vga_line1)[i] = expanded_chunk;
             reinterpret_cast<uint32_t*>(vga_line2)[i] = expanded_chunk;
         }
     }
 
+    // Push the updated back buffer to the VGA display engine
     engine.display();
 }
 
 void setup() {
     Serial.begin(115200);
 
+    // Initialize and start the parallel STN data sniffer (DMA & Timers)
     STNSniffer::instance().init();
     STNSniffer::instance().start();
 
+    // Initialize 3D/VGA engine subsystems with double buffering enabled
     engine3D.begin();
     engine3D.setDoubleBuffering(true);
 }
 
 void loop() {
+    // Wait for VGA vertical blanking interval to avoid screen tearing, then render
     VGA.waitVBlank();
     render_stn_to_vga_optimized(engine3D);
 }
